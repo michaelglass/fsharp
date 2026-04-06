@@ -79,9 +79,9 @@ type C() =
         |> shouldSucceed
 
     // https://github.com/dotnet/fsharp/issues/12796
-    // On Desktop .NET Framework, this still triggers FS0192 internal error in encodeCustomAttrElemType
-    // during attribute encoding. The bug is fixed on CoreCLR only.
-    [<FSharp.Test.FactForNETCOREAPP>]
+    // Passing an array of a user-defined type as a custom attribute argument is invalid per ECMA 335.
+    // Previously this caused FS0192 internal error in encodeCustomAttrElemType. Now it gives a proper diagnostic.
+    [<Fact>]
     let ``Issue 12796 - DefaultValue empty array on record field of array type should not cause internal error`` () =
         FSharp
             """
@@ -93,5 +93,6 @@ type A = { AField: string }
 type B = { [<DefaultValue([||] : A[])>] BField: A[] }
             """
         |> asLibrary
-        |> typecheck
-        |> shouldSucceed
+        |> compile
+        |> shouldFail
+        |> withErrorCode 3885

@@ -10223,6 +10223,14 @@ and GenAttribArg amap g eenv x (ilArgTy: ILType) =
     // Detect '[| ... |]' nodes
     | Expr.Op(TOp.Array, [ elemTy ], args, m), _ ->
         let ilElemTy = GenType amap m eenv.tyenv elemTy
+
+        // Validate element type is encodable in custom attribute metadata (ECMA 335).
+        // Only primitive types, enums, string, System.Type, and System.Object are valid.
+        match ilElemTy with
+        | ILType.Boxed tspec when tspec.Name <> "System.String" && tspec.Name <> "System.Object" && tspec.Name <> "System.Type" ->
+            error (Error(FSComp.SR.ilCustomAttrInvalidArrayElemType (tspec.Name), m))
+        | _ -> ()
+
         ILAttribElem.Array(ilElemTy, List.map (fun arg -> GenAttribArg amap g eenv arg ilElemTy) args)
 
     // Detect 'typeof<ty>' calls
