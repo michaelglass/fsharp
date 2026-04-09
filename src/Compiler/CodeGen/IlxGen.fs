@@ -10227,7 +10227,11 @@ and GenAttribArg amap g eenv x (ilArgTy: ILType) =
         // Validate element type is encodable in custom attribute metadata (ECMA 335).
         // Only primitive types, enums, string, System.Type, and System.Object are valid.
         match ilElemTy with
-        | ILType.Boxed tspec when tspec.Name <> "System.String" && tspec.Name <> "System.Object" && tspec.Name <> "System.Type" ->
+        | ILType.Boxed tspec when
+            tspec.Name <> "System.String"
+            && tspec.Name <> "System.Object"
+            && tspec.Name <> "System.Type"
+            ->
             error (Error(FSComp.SR.ilCustomAttrInvalidArrayElemType (tspec.Name), m))
         | _ -> ()
 
