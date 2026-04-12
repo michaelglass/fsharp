@@ -157,6 +157,15 @@ type internal ICacheKey<'TKey, 'TVersion> =
     abstract member GetVersion: unit -> 'TVersion
     abstract member GetLabel: unit -> string
 
+/// Optional disk-backed secondary cache for AsyncMemoize.
+/// When provided, AsyncMemoize will check this backend on LRU cache miss
+/// and store completed results for persistence across process restarts.
+type IDiskCache<'TKey, 'TVersion, 'TValue> =
+    abstract TryGet: key: 'TKey * version: 'TVersion -> 'TValue option
+    abstract Set: key: 'TKey * version: 'TVersion * label: string * value: 'TValue -> unit
+    abstract Remove: key: 'TKey -> unit
+    abstract Clear: unit -> unit
+
 [<Extension>]
 type Extensions =
 
@@ -180,11 +189,12 @@ type Job<'t> = AsyncLazy<Result<'t, exn> * CapturingDiagnosticsLogger>
 [<DebuggerDisplay("{DebuggerDisplay}")>]
 type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
     when 'TKey: equality and 'TVersion: equality and 'TKey: not null and 'TVersion: not null>
-    (?keepStrongly, ?keepWeakly, ?name: string, ?cancelUnawaitedJobs: bool, ?cancelDuplicateRunningJobs: bool) =
+    (?keepStrongly, ?keepWeakly, ?name: string, ?cancelUnawaitedJobs: bool, ?cancelDuplicateRunningJobs: bool, ?diskCache: IDiskCache<'TKey, 'TVersion, 'TValue>) =
 
     let _name = defaultArg name "N/A"
     let cancelUnawaitedJobs = defaultArg cancelUnawaitedJobs true
     let cancelDuplicateRunningJobs = defaultArg cancelDuplicateRunningJobs false
+    let mutable diskCache = diskCache
 
     let event = Event<_>()
 
@@ -234,6 +244,16 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
                     | Choice1Of2 result ->
                         log Finished key
                         Interlocked.Add(&duration, sw.ElapsedMilliseconds) |> ignore
+
+                        // Persist to disk cache on successful computation
+                        match diskCache with
+                        | Some dc ->
+                            try
+                                dc.Set(key.Key, key.Version, key.Label, result)
+                            with _ ->
+                                ()
+                        | None -> ()
+
                         return Result.Ok result, logger
                     | Choice2Of2 exn ->
                         log Failed key
@@ -250,11 +270,28 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
                 v
 
             let cacheSetNewJob () =
-                let job =
-                    Job(wrappedComputation, cancelUnawaited = cancelUnawaitedJobs, cacheException = false)
+                // Check disk cache before running computation
+                match diskCache with
+                | Some dc ->
+                    match dc.TryGet(key.Key, key.Version) with
+                    | Some value ->
+                        Interlocked.Increment &hits |> ignore
+                        let logger = CapturingDiagnosticsLogger "disk-cache"
+                        let job = Job(async { return Result.Ok value, logger }, cacheException = true)
+                        cache.Set(key.Key, key.Version, key.Label, job)
+                        job
+                    | None ->
+                        let job =
+                            Job(wrappedComputation, cancelUnawaited = cancelUnawaitedJobs, cacheException = false)
 
-                cache.Set(key.Key, key.Version, key.Label, job)
-                job
+                        cache.Set(key.Key, key.Version, key.Label, job)
+                        job
+                | None ->
+                    let job =
+                        Job(wrappedComputation, cancelUnawaited = cancelUnawaitedJobs, cacheException = false)
+
+                    cache.Set(key.Key, key.Version, key.Label, job)
+                    job
 
             otherVersions,
 
@@ -287,7 +324,9 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
                 | true, Some(Ok result, _) -> Some result
                 | _ -> None)
 
-    member _.Clear() = lock cache cache.Clear
+    member _.Clear() =
+        lock cache cache.Clear
+        diskCache |> Option.iter (fun dc -> try dc.Clear() with _ -> ())
 
     member _.Clear predicate =
         lock cache <| fun () -> cache.Clear predicate
@@ -297,6 +336,11 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
     member this.OnEvent = this.Event.Add
 
     member this.Count = lock cache <| fun () -> cache.Count
+
+    /// Set or replace the disk cache backend. Can be called after construction
+    /// to configure persistence without modifying cache creation sites.
+    member _.SetDiskCache(backend: IDiskCache<'TKey, 'TVersion, 'TValue>) =
+        diskCache <- Some backend
 
     member this.DebuggerDisplay =
 

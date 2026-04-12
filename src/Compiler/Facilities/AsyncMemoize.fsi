@@ -27,6 +27,15 @@ type internal ICacheKey<'TKey, 'TVersion> =
 
     abstract GetVersion: unit -> 'TVersion
 
+/// Optional disk-backed secondary cache for AsyncMemoize.
+/// When provided, AsyncMemoize will check this backend on LRU cache miss
+/// and store completed results for persistence across process restarts.
+type IDiskCache<'TKey, 'TVersion, 'TValue> =
+    abstract TryGet: key: 'TKey * version: 'TVersion -> 'TValue option
+    abstract Set: key: 'TKey * version: 'TVersion * label: string * value: 'TValue -> unit
+    abstract Remove: key: 'TKey -> unit
+    abstract Clear: unit -> unit
+
 [<System.Runtime.CompilerServices.Extension; Class>]
 type Extensions =
 
@@ -47,12 +56,14 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
     /// <param name="name">Name of the cache - used in tracing messages</param>
     /// <param name="cancelUnawaitedJobs">Cancels a job when all the awaiting requests are canceled. If set to false, unawaited job will run to completion and it's result will be cached.</param>
     /// <param name="cancelDuplicateRunningJobs">If true, when a job is started, all other jobs with the same key will be canceled.</param>
+    /// <param name="diskCache">Optional disk-backed secondary cache for persistence across process restarts.</param>
     new:
         ?keepStrongly: int *
         ?keepWeakly: int *
         ?name: string *
         ?cancelUnawaitedJobs: bool *
-        ?cancelDuplicateRunningJobs: bool ->
+        ?cancelDuplicateRunningJobs: bool *
+        ?diskCache: IDiskCache<'TKey, 'TVersion, 'TValue> ->
             AsyncMemoize<'TKey, 'TVersion, 'TValue>
 
     member Clear: unit -> unit
@@ -68,6 +79,9 @@ type internal AsyncMemoize<'TKey, 'TVersion, 'TValue
     member OnEvent: ((JobEvent * (string * 'TKey * 'TVersion) -> unit) -> unit)
 
     member Count: int
+
+    /// Set or replace the disk cache backend after construction.
+    member SetDiskCache: backend: IDiskCache<'TKey, 'TVersion, 'TValue> -> unit
 
 /// A drop-in replacement for AsyncMemoize that disables caching and just runs the computation every time.
 type internal AsyncMemoizeDisabled<'TKey, 'TVersion, 'TValue when 'TKey: equality and 'TVersion: equality> =
