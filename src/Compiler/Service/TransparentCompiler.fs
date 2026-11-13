@@ -1054,32 +1054,7 @@ type internal TransparentCompiler
                 // Prepare the frameworkTcImportsCache
                 let! tcGlobals, frameworkTcImports = ComputeFrameworkImports tcConfig frameworkDLLs nonFrameworkResolutions
 
-                // If the tcGlobals was loaded from a different project, langVersion and realsig may be different
-                // for each cached project.  So here we create a new tcGlobals, with the existing framework values
-                // and updated realsig and langversion
-                let tcGlobals =
-                    if
-                        tcGlobals.langVersion <> tcConfig.langVersion
-                        || tcGlobals.realsig <> tcConfig.realsig
-                    then
-                        TcGlobals(
-                            tcGlobals.compilingFSharpCore,
-                            tcGlobals.ilg,
-                            tcGlobals.fslibCcu,
-                            tcGlobals.directoryToResolveRelativePaths,
-                            tcGlobals.isInteractive,
-                            tcGlobals.checkNullness,
-                            tcGlobals.useReflectionFreeCodeGen,
-                            tcGlobals.tryFindSysTypeCcuHelper,
-                            tcGlobals.emitDebugInfoInQuotations,
-                            tcGlobals.noDebugAttributes,
-                            tcGlobals.pathMap,
-                            tcConfig.langVersion,
-                            tcConfig.realsig,
-                            tcConfig.compilationMode
-                        )
-                    else
-                        tcGlobals
+                let tcGlobals = TcGlobalsForTcConfig tcConfig tcGlobals
 
                 // Note we are not calling diagnosticsLogger.GetDiagnostics() anywhere for this task.
                 // This is ok because not much can actually go wrong here.
