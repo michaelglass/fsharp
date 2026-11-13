@@ -553,6 +553,7 @@
     <Compile Include="FSharpChecker\ReflectionFree.fs" />
     <Compile Include="FSharpChecker\ScriptResolutionRules.fs" />
     <Compile Include="FSharpChecker\ProjectSnapshot.fs" />
+    <Compile Include="FSharpChecker\ScopedNowarn.fs" />
     <Compile Include="FSharpChecker\TransparentCompiler.fs" />
     <Compile Include="FSharpChecker\SymbolUse.fs" />
     <Compile Include="FSharpChecker\FindReferences.fs" />

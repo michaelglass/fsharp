@@ -1293,8 +1293,14 @@ type internal TransparentCompiler
                             Activity.Tags.version, file.StringVersion
                         |]
 
-                let diagnosticsLogger =
-                    CompilationDiagnosticLogger("Parse", tcConfig.diagnosticsOptions)
+                // The parse result is cached without regard to the TcConfig, so the warn scopes of the file go into options
+                // of its own, to be merged into the options of each TcConfig the file is checked with.
+                let diagnosticOptions =
+                    { tcConfig.diagnosticsOptions with
+                        WarnScopeData = None
+                    }
+
+                let diagnosticsLogger = CompilationDiagnosticLogger("Parse", diagnosticOptions)
                 // Return the disposable object that cleans up
                 use _holder = new CompilationGlobalsScope(diagnosticsLogger, BuildPhase.Parse)
 
@@ -1303,14 +1309,16 @@ type internal TransparentCompiler
                 let sourceText = file.Source
 
                 let input =
-                    ParseOneInputSourceText(tcConfig, lexResourceManager, fileName, flags, diagnosticsLogger, sourceText)
+                    ParseOneInputSourceText(tcConfig, diagnosticOptions, lexResourceManager, fileName, flags, diagnosticsLogger, sourceText)
 
                 // TODO: Hashing of syntax tree
                 let inputHash = file.Version
 
                 fileParsed.Trigger(fileName, Unchecked.defaultof<_>)
 
-                return FSharpParsedFile(fileName, inputHash, sourceText, input, diagnosticsLogger.GetDiagnostics())
+                let warnScopes = WarnScopes.TryGetFileWarnScopes diagnosticOptions fileName
+
+                return FSharpParsedFile(fileName, inputHash, sourceText, input, diagnosticsLogger.GetDiagnostics(), warnScopes)
             }
         )
 
@@ -1439,6 +1447,10 @@ type internal TransparentCompiler
             projectSnapshot.FileKey(index).WithExtraVersion((bootstrapInfo.Id, prevTcInfo.tcIntermediateIds))
 
         let _label, _k, _version = key.GetLabel(), key.GetKey(), key.GetVersion()
+
+        // Outside the cache: the diagnostics of a file whose check is cached are created again with these options.
+        projectSnapshot.SourceFiles[index].WarnScopes
+        |> Option.iter (WarnScopes.MergeFileWarnScopes bootstrapInfo.TcConfig.diagnosticsOptions)
 
         caches.TcIntermediate.Get(
             key,
@@ -1717,6 +1729,9 @@ type internal TransparentCompiler
     let getParseResult (projectSnapshot: ProjectSnapshot) creationDiags file (tcConfig: TcConfig) =
         async {
             let! parsedFile = ComputeParseFile projectSnapshot tcConfig file
+
+            parsedFile.WarnScopes
+            |> Option.iter (WarnScopes.MergeFileWarnScopes tcConfig.diagnosticsOptions)
 
             let parseDiagnostics =
                 DiagnosticHelpers.CreateDiagnostics(
