@@ -1423,9 +1423,27 @@ type NodeToTypeCheck =
     /// Even though the actual implementation file was not type-checked.
     | ArtificialImplFile of signatureFileIndex: FileIndex
 
+/// The checked implementation file a finisher reports. The finisher keeps the file alive until its owner calls
+/// Release; after that it reports the file only while something else keeps it alive.
+[<Sealed>]
+type ImplFileHolder(implFile: CheckedImplFile) =
+    let weak = WeakReference<CheckedImplFile>(implFile)
+    let mutable kept = implFile
+
+    member _.TryGet() =
+        if not (obj.ReferenceEquals(kept, null)) then
+            Some kept
+        else
+            match weak.TryGetTarget() with
+            | true, implFile -> Some implFile
+            | _ -> None
+
+    member _.Release() = kept <- Unchecked.defaultof<_>
+
 /// Typecheck a single file (or interactive entry into F# Interactive)
-/// <returns>a callback functions that takes a `TcState` and will add the checked result to it.</returns>
-let CheckOneInputWithCallback
+/// <returns>a callback functions that takes a `TcState` and will add the checked result to it, and for an
+/// implementation file the holder of its checked contents.</returns>
+let CheckOneInputWithCallbackAndImplFile
     (node: NodeToTypeCheck)
     (
         (checkForErrors,
@@ -1439,7 +1457,7 @@ let CheckOneInputWithCallback
          _skipImplIfSigExists: bool):
             (unit -> bool) * TcConfig * TcImports * TcGlobals * LongIdent option * TcResultsSink * TcState * ParsedInput * bool
     )
-    : Cancellable<Finisher<NodeToTypeCheck, TcState, PartialResult>> =
+    : Cancellable<Finisher<NodeToTypeCheck, TcState, PartialResult> * ImplFileHolder option> =
     cancellable {
         try
             CheckSimulateException tcConfig
@@ -1510,7 +1528,8 @@ let CheckOneInputWithCallback
                                 }
 
                             partialResult, tcState)
-                    )
+                    ),
+                    None
 
             | ParsedInput.ImplFile file ->
                 let qualNameOfFile = file.QualifiedName
@@ -1535,6 +1554,11 @@ let CheckOneInputWithCallback
                         tcConfig.diagnosticsOptions
                     )
 
+                // The finisher reads the checked contents through the holder, so whoever owns the holder decides
+                // how long they stay alive. It needs only the signature to add the file to the state.
+                let implSignature = implFile.Signature
+                let implFileHolder = ImplFileHolder implFile
+
                 return
                     Finisher(
                         node,
@@ -1545,18 +1569,11 @@ let CheckOneInputWithCallback
 
                             let ccuSigForFile, fsTcState =
                                 AddCheckResultsToTcState
-                                    (tcGlobals,
-                                     amap,
-                                     false,
-                                     prefixPathOpt,
-                                     tcSink,
-                                     tcState.tcsTcImplEnv,
-                                     qualNameOfFile,
-                                     implFile.Signature)
+                                    (tcGlobals, amap, false, prefixPathOpt, tcSink, tcState.tcsTcImplEnv, qualNameOfFile, implSignature)
                                     tcState
 
                             let partialResult =
-                                (tcEnvAtEnd, topAttrs, Some implFile, ccuSigForFile, ownSigForFile)
+                                (tcEnvAtEnd, topAttrs, implFileHolder.TryGet(), ccuSigForFile, ownSigForFile)
 
                             let tcState =
                                 { fsTcState with
@@ -1565,11 +1582,38 @@ let CheckOneInputWithCallback
                                 }
 
                             partialResult, tcState)
-                    )
+                    ),
+                    Some implFileHolder
 
         with RecoverableException e ->
             errorRecovery e range0
-            return Finisher(node, (fun tcState -> PartialResultOnError tcState, tcState))
+            return Finisher(node, (fun tcState -> PartialResultOnError tcState, tcState)), None
+    }
+
+/// Typecheck a single file (or interactive entry into F# Interactive)
+/// <returns>a callback functions that takes a `TcState` and will add the checked result to it.</returns>
+let CheckOneInputWithCallback
+    (node: NodeToTypeCheck)
+    (
+        (checkForErrors,
+         tcConfig: TcConfig,
+         tcImports: TcImports,
+         tcGlobals,
+         prefixPathOpt,
+         tcSink,
+         tcState: TcState,
+         input: ParsedInput,
+         _skipImplIfSigExists: bool):
+            (unit -> bool) * TcConfig * TcImports * TcGlobals * LongIdent option * TcResultsSink * TcState * ParsedInput * bool
+    )
+    : Cancellable<Finisher<NodeToTypeCheck, TcState, PartialResult>> =
+    cancellable {
+        let! finisher, _implFileHolder =
+            CheckOneInputWithCallbackAndImplFile
+                node
+                (checkForErrors, tcConfig, tcImports, tcGlobals, prefixPathOpt, tcSink, tcState, input, _skipImplIfSigExists)
+
+        return finisher
     }
 
 let AddSignatureResultToTcImplEnv (tcImports: TcImports, tcGlobals, prefixPathOpt, tcSink, tcState, input: ParsedInput) =
