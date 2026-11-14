@@ -53,6 +53,16 @@ type internal TcInfo =
         sink: TcResultsSinkImpl list
     }
 
+/// The type check sink of a cached file result. A checker that keeps background resolutions or symbol uses
+/// keeps it for as long as the result is cached. Otherwise only the request that computed the result holds it
+/// strongly, and a later request that needs it checks the file again.
+[<NoEquality; NoComparison>]
+type internal TcIntermediateSink =
+    | Kept of TcResultsSinkImpl
+    | Released of System.WeakReference<TcResultsSinkImpl>
+
+    member TryGet: unit -> TcResultsSinkImpl option
+
 [<NoEquality; NoComparison>]
 type internal TcIntermediate =
     {
@@ -67,7 +77,7 @@ type internal TcIntermediate =
         /// Accumulated diagnostics, last file first
         tcDiagnosticsRev: PhasedDiagnostic array list
         tcDependencyFiles: string list
-        sink: TcResultsSinkImpl
+        mutable sink: TcIntermediateSink
     }
 
 /// Things we need to start parsing and checking files for a given project snapshot
