@@ -78,6 +78,69 @@ type internal TcInfo =
 
     member x.TcDiagnostics = Array.concat (List.rev x.tcDiagnosticsRev)
 
+/// Forwards to a type check sink without keeping it alive. A file's finisher captures the sink the file was
+/// checked with, so a cached file result would otherwise keep every resolution of the file through it.
+[<Sealed>]
+type internal WeakTcResultsSink(target: TcResultsSinkImpl) =
+    let weak = WeakReference<TcResultsSinkImpl>(target)
+
+    let withTarget (notify: ITypecheckResultsSink -> unit) =
+        match weak.TryGetTarget() with
+        | true, sink -> notify (sink :> ITypecheckResultsSink)
+        | _ -> ()
+
+    interface ITypecheckResultsSink with
+        member _.NotifyEnvWithScope(m, nenv, ad) =
+            withTarget (fun sink -> sink.NotifyEnvWithScope(m, nenv, ad))
+
+        member _.NotifyExprHasType(ty, nenv, ad, m) =
+            withTarget (fun sink -> sink.NotifyExprHasType(ty, nenv, ad, m))
+
+        member _.NotifyExprHasTypeSynthetic(ty, nenv, ad, m) =
+            withTarget (fun sink -> sink.NotifyExprHasTypeSynthetic(ty, nenv, ad, m))
+
+        member _.NotifyNameResolution(endPos, item, tpinst, occurrence, nenv, ad, m, replace) =
+            withTarget (fun sink -> sink.NotifyNameResolution(endPos, item, tpinst, occurrence, nenv, ad, m, replace))
+
+        member _.NotifyMethodGroupNameResolution(endPos, item, itemMethodGroup, tpinst, occurrence, nenv, ad, m, replace) =
+            withTarget (fun sink ->
+                sink.NotifyMethodGroupNameResolution(endPos, item, itemMethodGroup, tpinst, occurrence, nenv, ad, m, replace))
+
+        member _.NotifyFormatSpecifierLocation(m, numArgs) =
+            withTarget (fun sink -> sink.NotifyFormatSpecifierLocation(m, numArgs))
+
+        member _.NotifyRelatedSymbolUse(m, item, kind) =
+            withTarget (fun sink -> sink.NotifyRelatedSymbolUse(m, item, kind))
+
+        member _.NotifyOpenDeclaration openDeclaration =
+            withTarget (fun sink -> sink.NotifyOpenDeclaration openDeclaration)
+
+        member _.CurrentSourceText =
+            match weak.TryGetTarget() with
+            | true, sink -> (sink :> ITypecheckResultsSink).CurrentSourceText
+            | _ -> None
+
+        member _.FormatStringCheckContext =
+            match weak.TryGetTarget() with
+            | true, sink -> (sink :> ITypecheckResultsSink).FormatStringCheckContext
+            | _ -> None
+
+/// The type check sink of a cached file result. A checker that keeps background resolutions or symbol uses
+/// keeps it for as long as the result is cached. Otherwise only the request that computed the result holds it
+/// strongly, and a later request that needs it checks the file again.
+[<NoEquality; NoComparison>]
+type internal TcIntermediateSink =
+    | Kept of TcResultsSinkImpl
+    | Released of WeakReference<TcResultsSinkImpl>
+
+    member this.TryGet() =
+        match this with
+        | Kept sink -> Some sink
+        | Released weak ->
+            match weak.TryGetTarget() with
+            | true, sink -> Some sink
+            | _ -> None
+
 [<NoEquality; NoComparison>]
 type internal TcIntermediate =
     {
@@ -95,7 +158,7 @@ type internal TcIntermediate =
 
         tcDependencyFiles: string list
 
-        sink: TcResultsSinkImpl
+        mutable sink: TcIntermediateSink
     }
 
 /// Things we need to start parsing and checking files for a given project snapshot
@@ -949,6 +1012,10 @@ type internal TransparentCompiler
 
     let mutable TcIntermediateIdCounter = 0
 
+    /// Whether a cached file result keeps its type check sink for later requests.
+    let keepsBackgroundResults =
+        keepAllBackgroundResolutions || keepAllBackgroundSymbolUses
+
     /// Bootstrap info that does not depend source files
     let ComputeBootstrapInfoStatic (projectSnapshot: ProjectSnapshotBase<_>, tcConfig: TcConfig, assemblyName: string, loadClosureOpt) =
         let cacheKey = projectSnapshot.BaseCacheKeyWith("BootstrapInfoStatic", assemblyName)
@@ -1434,6 +1501,14 @@ type internal TransparentCompiler
 
                 let sink = TcResultsSinkImpl(tcGlobals, file.SourceText)
 
+                // The finisher keeps what it is checked with: without background resolutions or symbol uses,
+                // it must not keep the sink (see TcIntermediateSink).
+                let checkSink =
+                    if keepsBackgroundResults then
+                        sink :> ITypecheckResultsSink
+                    else
+                        WeakTcResultsSink sink :> ITypecheckResultsSink
+
                 let hadParseErrors =
                     file.ParseDiagnostics
                     |> Array.exists (fun diagnostic -> diagnostic.Severity = FSharpDiagnosticSeverity.Error)
@@ -1454,7 +1529,7 @@ type internal TransparentCompiler
                              tcImports,
                              tcGlobals,
                              None,
-                             TcResultsSink.WithSink sink,
+                             TcResultsSink.WithSink checkSink,
                              prevTcInfo.tcState,
                              input,
                              true)
@@ -1471,7 +1546,7 @@ type internal TransparentCompiler
                             moduleNamesDict = moduleNamesDict
                             tcDiagnosticsRev = [ errHandler.CollectedPhasedDiagnostics ]
                             tcDependencyFiles = [ fileName ]
-                            sink = sink
+                            sink = TcIntermediateSink.Kept sink
                         }
                 finally
                     ()
@@ -1479,13 +1554,49 @@ type internal TransparentCompiler
             }
         )
 
-    let processGraphNode projectSnapshot bootstrapInfo dependencyFiles collectSinks (fileNode: NodeToTypeCheck) tcInfo =
+    let processGraphNode
+        (projectSnapshot: ProjectSnapshotBase<FSharpParsedFile>)
+        bootstrapInfo
+        dependencyFiles
+        collectSinks
+        (fileNode: NodeToTypeCheck)
+        tcInfo
+        =
         // TODO: should this be node?
         async {
             match fileNode with
             | NodeToTypeCheck.PhysicalFile index ->
 
-                let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
+                // The resolutions of the file being checked, or of every file when collecting them all.
+                let needsSink = collectSinks || index = projectSnapshot.SourceFiles.Length - 1
+
+                let! tcIntermediate, sink =
+                    async {
+                        let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
+
+                        match tcIntermediate.sink.TryGet() with
+                        | Some sink -> return tcIntermediate, sink
+                        | None when not needsSink -> return tcIntermediate, TcResultsSinkImpl(bootstrapInfo.TcGlobals)
+                        | None ->
+                            // The cached result no longer has its resolutions. Check the file again. Its new result
+                            // declares new entities, and results computed from the old one are keyed by its id, so
+                            // they are not combined with it.
+                            let fileKey = projectSnapshot.FileKey(index).GetKey()
+                            caches.TcIntermediate.Clear(fun key -> key = fileKey)
+
+                            let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
+
+                            return
+                                tcIntermediate,
+                                tcIntermediate.sink.TryGet()
+                                |> Option.defaultWith (fun () -> TcResultsSinkImpl(bootstrapInfo.TcGlobals))
+                    }
+
+                // This request holds the sink until its results are built; the cache does not keep it alive.
+                match tcIntermediate.sink with
+                | TcIntermediateSink.Kept _ when not keepsBackgroundResults ->
+                    tcIntermediate.sink <- TcIntermediateSink.Released(WeakReference<_>(sink))
+                | _ -> ()
 
                 let (Finisher(node = node; finisher = finisher)) = tcIntermediate.finisher
 
@@ -1516,11 +1627,7 @@ type internal TransparentCompiler
                                 graphNode = Some node
                                 stateContainsNodes = tcInfo.stateContainsNodes |> Set.add node
                                 tcIntermediateIds = tcInfo.tcIntermediateIds |> Set.add tcIntermediate.id
-                                sink =
-                                    if collectSinks then
-                                        tcIntermediate.sink :: tcInfo.sink
-                                    else
-                                        [ tcIntermediate.sink ]
+                                sink = if collectSinks then sink :: tcInfo.sink else [ sink ]
                             })
                     )
 
