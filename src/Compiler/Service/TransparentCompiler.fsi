@@ -53,15 +53,26 @@ type internal TcInfo =
         sink: TcResultsSinkImpl list
     }
 
-/// The type check sink of a cached file result. A checker that keeps background resolutions or symbol uses
-/// keeps it for as long as the result is cached. Otherwise only the request that computed the result holds it
-/// strongly, and a later request that needs it checks the file again.
+/// What a cached file result keeps for a later request that reads it. The request that reads the file's type check
+/// sink also reads its typed contents, so the two are kept and released together.
 [<NoEquality; NoComparison>]
-type internal TcIntermediateSink =
-    | Kept of TcResultsSinkImpl
-    | Released of System.WeakReference<TcResultsSinkImpl>
+type internal TcIntermediateRetained =
+    {
+        Sink: TcResultsSinkImpl
 
-    member TryGet: unit -> TcResultsSinkImpl option
+        /// None for a signature file or a failed check
+        ImplFile: CheckedImplFile option
+    }
+
+/// The retained parts of a cached file result. A checker that keeps background resolutions or symbol uses keeps
+/// them for as long as the result is cached. Otherwise only the request that computed the result holds them
+/// strongly, and a later request that needs them checks the file again.
+[<NoEquality; NoComparison>]
+type internal TcIntermediateRetention =
+    | Kept of TcIntermediateRetained
+    | Released of System.WeakReference<TcIntermediateRetained>
+
+    member TryGet: unit -> TcIntermediateRetained option
 
 [<NoEquality; NoComparison>]
 type internal TcIntermediate =
@@ -77,7 +88,10 @@ type internal TcIntermediate =
         /// Accumulated diagnostics, last file first
         tcDiagnosticsRev: PhasedDiagnostic array list
         tcDependencyFiles: string list
-        mutable sink: TcIntermediateSink
+        mutable retained: TcIntermediateRetention
+
+        /// The finisher's hold on the file's typed contents, released when the result stops keeping them
+        implFileHolder: ImplFileHolder option
     }
 
 /// Things we need to start parsing and checking files for a given project snapshot

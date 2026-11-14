@@ -125,20 +125,31 @@ type internal WeakTcResultsSink(target: TcResultsSinkImpl) =
             | true, sink -> (sink :> ITypecheckResultsSink).FormatStringCheckContext
             | _ -> None
 
-/// The type check sink of a cached file result. A checker that keeps background resolutions or symbol uses
-/// keeps it for as long as the result is cached. Otherwise only the request that computed the result holds it
-/// strongly, and a later request that needs it checks the file again.
+/// What a cached file result keeps for a later request that reads it. The request that reads the file's type check
+/// sink also reads its typed contents, so the two are kept and released together.
 [<NoEquality; NoComparison>]
-type internal TcIntermediateSink =
-    | Kept of TcResultsSinkImpl
-    | Released of WeakReference<TcResultsSinkImpl>
+type internal TcIntermediateRetained =
+    {
+        Sink: TcResultsSinkImpl
+
+        /// None for a signature file or a failed check
+        ImplFile: CheckedImplFile option
+    }
+
+/// The retained parts of a cached file result. A checker that keeps background resolutions or symbol uses keeps
+/// them for as long as the result is cached. Otherwise only the request that computed the result holds them
+/// strongly, and a later request that needs them checks the file again.
+[<NoEquality; NoComparison>]
+type internal TcIntermediateRetention =
+    | Kept of TcIntermediateRetained
+    | Released of WeakReference<TcIntermediateRetained>
 
     member this.TryGet() =
         match this with
-        | Kept sink -> Some sink
+        | Kept retained -> Some retained
         | Released weak ->
             match weak.TryGetTarget() with
-            | true, sink -> Some sink
+            | true, retained -> Some retained
             | _ -> None
 
 [<NoEquality; NoComparison>]
@@ -158,7 +169,10 @@ type internal TcIntermediate =
 
         tcDependencyFiles: string list
 
-        mutable sink: TcIntermediateSink
+        mutable retained: TcIntermediateRetention
+
+        /// The finisher's hold on the file's typed contents, released when the result stops keeping them
+        implFileHolder: ImplFileHolder option
     }
 
 /// Things we need to start parsing and checking files for a given project snapshot
@@ -1574,7 +1588,7 @@ type internal TransparentCompiler
                 let sink = TcResultsSinkImpl(tcGlobals, file.SourceText)
 
                 // The finisher keeps what it is checked with: without background resolutions or symbol uses,
-                // it must not keep the sink (see TcIntermediateSink).
+                // it must not keep the sink (see TcIntermediateRetention).
                 let checkSink =
                     if keepsBackgroundResults then
                         sink :> ITypecheckResultsSink
@@ -1593,8 +1607,8 @@ type internal TransparentCompiler
                 try
                     //do! maxParallelismSemaphore.WaitAsync(ct) |> NodeCode.AwaitTask
 
-                    let! finisher =
-                        CheckOneInputWithCallback
+                    let! finisher, implFileHolder =
+                        CheckOneInputWithCallbackAndImplFile
                             nodeToCheck
                             ((fun () -> hadParseErrors || diagnosticsLogger.CheckForRealErrorsIgnoringWarnings),
                              tcConfig,
@@ -1618,7 +1632,13 @@ type internal TransparentCompiler
                             moduleNamesDict = moduleNamesDict
                             tcDiagnosticsRev = [ errHandler.CollectedPhasedDiagnostics ]
                             tcDependencyFiles = [ fileName ]
-                            sink = TcIntermediateSink.Kept sink
+                            retained =
+                                TcIntermediateRetention.Kept
+                                    {
+                                        Sink = sink
+                                        ImplFile = implFileHolder |> Option.bind _.TryGet()
+                                    }
+                            implFileHolder = implFileHolder
                         }
                 finally
                     ()
@@ -1639,36 +1659,42 @@ type internal TransparentCompiler
             match fileNode with
             | NodeToTypeCheck.PhysicalFile index ->
 
-                // The resolutions of the file being checked, or of every file when collecting them all.
-                let needsSink = collectSinks || index = projectSnapshot.SourceFiles.Length - 1
+                // The resolutions and typed contents of the file being checked, or of every file when collecting
+                // them all.
+                let needsRetained = collectSinks || index = projectSnapshot.SourceFiles.Length - 1
 
-                let! tcIntermediate, sink =
+                let! tcIntermediate, retained =
                     async {
                         let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
 
-                        match tcIntermediate.sink.TryGet() with
-                        | Some sink -> return tcIntermediate, sink
-                        | None when not needsSink -> return tcIntermediate, TcResultsSinkImpl(bootstrapInfo.TcGlobals)
+                        match tcIntermediate.retained.TryGet() with
+                        | Some retained -> return tcIntermediate, Some retained
+                        | None when not needsRetained -> return tcIntermediate, None
                         | None ->
-                            // The cached result no longer has its resolutions. Check the file again. Its new result
-                            // declares new entities, and results computed from the old one are keyed by its id, so
-                            // they are not combined with it.
+                            // The cached result no longer has what this request needs. Check the file again. Its new
+                            // result declares new entities, and results computed from the old one are keyed by its
+                            // id, so they are not combined with it.
                             let fileKey = projectSnapshot.FileKey(index).GetKey()
                             caches.TcIntermediate.Clear(fun key -> key = fileKey)
 
                             let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
 
-                            return
-                                tcIntermediate,
-                                tcIntermediate.sink.TryGet()
-                                |> Option.defaultWith (fun () -> TcResultsSinkImpl(bootstrapInfo.TcGlobals))
+                            return tcIntermediate, tcIntermediate.retained.TryGet()
                     }
 
-                // This request holds the sink until its results are built; the cache does not keep it alive.
-                match tcIntermediate.sink with
-                | TcIntermediateSink.Kept _ when not keepsBackgroundResults ->
-                    tcIntermediate.sink <- TcIntermediateSink.Released(WeakReference<_>(sink))
-                | _ -> ()
+                let sink =
+                    match retained with
+                    | Some retained -> retained.Sink
+                    | None -> TcResultsSinkImpl(bootstrapInfo.TcGlobals)
+
+                // This request holds the retained parts until its results are built; the cache does not keep them alive.
+                if not keepsBackgroundResults then
+                    match tcIntermediate.retained with
+                    | TcIntermediateRetention.Kept kept ->
+                        tcIntermediate.retained <- TcIntermediateRetention.Released(WeakReference<_>(kept))
+                    | TcIntermediateRetention.Released _ -> ()
+
+                    tcIntermediate.implFileHolder |> Option.iter _.Release()
 
                 let (Finisher(node = node; finisher = finisher)) = tcIntermediate.finisher
 
@@ -1678,6 +1704,10 @@ type internal TransparentCompiler
                         (fun tcInfo ->
 
                             let partialResult, tcState = finisher tcInfo.tcState
+
+                            // The finisher reports the typed contents only while they are alive: keep them alive
+                            // until it has run.
+                            GC.KeepAlive retained
 
                             let tcEnv, topAttribs, _, ccuSigForFile, _ = partialResult
 

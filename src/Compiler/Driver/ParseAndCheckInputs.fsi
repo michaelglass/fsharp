@@ -184,6 +184,30 @@ val CheckOneInput:
     input: ParsedInput ->
         Cancellable<PartialResult * TcState>
 
+/// The checked implementation file a finisher reports. The finisher keeps the file alive until its owner calls
+/// Release; after that it reports the file only while something else keeps it alive.
+[<Sealed>]
+type ImplFileHolder =
+    new: implFile: CheckedImplFile -> ImplFileHolder
+
+    member TryGet: unit -> CheckedImplFile option
+
+    member Release: unit -> unit
+
+/// As CheckOneInputWithCallback, also returning, for an implementation file, the holder of its checked contents.
+val CheckOneInputWithCallbackAndImplFile:
+    node: NodeToTypeCheck ->
+    checkForErrors: (unit -> bool) *
+    tcConfig: TcConfig *
+    tcImports: TcImports *
+    tcGlobals: TcGlobals *
+    prefixPathOpt: LongIdent option *
+    tcSink: TcResultsSink *
+    tcState: TcState *
+    input: ParsedInput *
+    _skipImplIfSigExists: bool ->
+        Cancellable<Finisher<NodeToTypeCheck, TcState, PartialResult> * ImplFileHolder option>
+
 val CheckOneInputWithCallback:
     node: NodeToTypeCheck ->
     checkForErrors: (unit -> bool) *

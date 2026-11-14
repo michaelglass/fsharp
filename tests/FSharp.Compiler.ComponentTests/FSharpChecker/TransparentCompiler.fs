@@ -622,7 +622,7 @@ let ``A cached file result does not keep its type check sink when background res
                     let key = keys |> Seq.find (fun kv -> kv.Key.Contains "FileA") |> _.Value
                     let resultForA = checker.Caches.TcIntermediate.TryGet(key, fun _ -> true)
                     Assert.True(resultForA.IsSome, "A's file result should still be cached")
-                    Assert.True(resultForA.Value.sink.TryGet().IsNone, "A's type check sink should have been released")
+                    Assert.True(resultForA.Value.retained.TryGet().IsNone, "A's type check sink should have been released")
                 })
         } |> ignore
     finally
@@ -692,6 +692,117 @@ let ``A later request that needs a file's resolutions gets them after the file's
                         |> Array.filter (fun symbolUse -> symbolUse.FileName.EndsWith "FileA.fs")
 
                     Assert.NotEmpty usesInA
+                })
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
+/// As foregroundOnlyChecker, keeping the typed contents of the files it checks.
+let private foregroundOnlyCheckerWithContents cacheSizes =
+    FSharpChecker.Create(
+        useTransparentCompiler = true,
+        keepAssemblyContents = true,
+        keepAllBackgroundResolutions = false,
+        keepAllBackgroundSymbolUses = false,
+        transparentCompilerCacheSizes = cacheSizes)
+
+[<Fact>]
+let ``A cached file result does not keep its typed implementation when background resolutions and symbol uses are off`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let b = ModuleA.a.X" })
+
+    let checker = foregroundOnlyCheckerWithContents (CacheSizes.Create 100)
+
+    // The cache key of A's file result, as the cache reports it.
+    let keys = ConcurrentDictionary<string, string * ProjectSnapshot.FSharpProjectIdentifier>()
+    checker.Caches.TcIntermediate.OnEvent(fun (_, (label, key, _)) -> keys[label] <- key)
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            checkFile "B" expectOk
+            withChecker (fun checker ->
+                async {
+                    collectGarbage ()
+                    let key = keys |> Seq.find (fun kv -> kv.Key.Contains "FileA") |> _.Value
+                    let resultForA = checker.Caches.TcIntermediate.TryGet(key, fun _ -> true)
+                    Assert.True(resultForA.IsSome, "A's file result should still be cached")
+                    Assert.True(resultForA.Value.implFileHolder.IsSome, "A's file result should have an implementation holder")
+                    Assert.True(resultForA.Value.implFileHolder.Value.TryGet().IsNone, "A's typed implementation should have been released")
+                })
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
+[<Fact>]
+let ``A file whose cached typed implementation was released is checked again with its contents, and downstream files stay consistent`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let value : ModuleA.T = ModuleA.a" },
+            { sourceFile "C" [ "A"; "B" ] with Source = "let ok : ModuleA.T = ModuleB.value" })
+
+    // Keep only the latest file check result, so checking A again cannot be answered from it.
+    let checker =
+        foregroundOnlyCheckerWithContents
+            { CacheSizes.Create 100 with
+                ParseAndCheckFileInProjectKeepStrongly = 1
+                ParseAndCheckFileInProjectKeepWeakly = 0 }
+
+    let expectOkWithContents parseAndCheckResults ctx =
+        expectOk parseAndCheckResults ctx
+        Assert.True((getTypeCheckResult parseAndCheckResults).ImplementationFile.IsSome, "the file's typed implementation should be reported")
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            checkFile "A" expectOkWithContents
+            checkFile "B" expectOk
+            withChecker (fun _ -> async { collectGarbage () })
+            checkFile "A" expectOkWithContents
+            checkFile "C" expectOk
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
+[<Fact>]
+let ``A later request that needs a file's typed implementation gets it after the file's cached contents were released`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let value : ModuleA.T = ModuleA.a" })
+
+    let checker = foregroundOnlyCheckerWithContents (CacheSizes.Create 100)
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            // The first request computes and caches A's result.
+            checkFile "B" expectOk
+            withChecker (fun _ -> async { collectGarbage () })
+            // A second request runs A's cached result again and reads every file's typed contents.
+            withChecker (fun checker ->
+                async {
+                    let options = project.GetProjectOptions checker
+                    let! snapshot = FSharpProjectSnapshot.FromOptions(options, DocumentSource.FileSystem)
+                    let! results = checker.ParseAndCheckProject(snapshot)
+
+                    let contentsOfA =
+                        results.AssemblyContents.ImplementationFiles
+                        |> List.filter (fun implFile -> implFile.FileName.EndsWith "FileA.fs")
+
+                    Assert.NotEmpty contentsOfA
                 })
         } |> ignore
     finally
