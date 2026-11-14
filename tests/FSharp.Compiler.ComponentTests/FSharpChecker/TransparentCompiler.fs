@@ -582,6 +582,86 @@ let ``Recomputing a collected upstream file result does not mix it with cached d
     finally
         builder.DeleteProjectDir()
 
+let private collectGarbage () =
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    GC.Collect()
+
+/// A checker that keeps neither background resolutions nor symbol uses, as a host that only reads the
+/// results of the file it just checked would create it.
+let private foregroundOnlyChecker cacheSizes =
+    FSharpChecker.Create(
+        useTransparentCompiler = true,
+        keepAllBackgroundResolutions = false,
+        keepAllBackgroundSymbolUses = false,
+        transparentCompilerCacheSizes = cacheSizes)
+
+[<Fact>]
+let ``A cached file result does not keep its type check sink when background resolutions and symbol uses are off`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let b = ModuleA.a.X" })
+
+    let checker = foregroundOnlyChecker (CacheSizes.Create 100)
+
+    // The cache key of A's file result, as the cache reports it.
+    let keys = ConcurrentDictionary<string, string * ProjectSnapshot.FSharpProjectIdentifier>()
+    checker.Caches.TcIntermediate.OnEvent(fun (_, (label, key, _)) -> keys[label] <- key)
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            checkFile "B" expectOk
+            withChecker (fun checker ->
+                async {
+                    collectGarbage ()
+                    let key = keys |> Seq.find (fun kv -> kv.Key.Contains "FileA") |> _.Value
+                    let resultForA = checker.Caches.TcIntermediate.TryGet(key, fun _ -> true)
+                    Assert.True(resultForA.IsSome, "A's file result should still be cached")
+                    Assert.True(resultForA.Value.sink.TryGet().IsNone, "A's type check sink should have been released")
+                })
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
+[<Fact>]
+let ``A file whose cached sink was released is checked again with its resolutions, and downstream files stay consistent`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let value : ModuleA.T = ModuleA.a" },
+            { sourceFile "C" [ "A"; "B" ] with Source = "let ok : ModuleA.T = ModuleB.value" })
+
+    // Keep only the latest file check result, so checking A again cannot be answered from it.
+    let checker =
+        foregroundOnlyChecker
+            { CacheSizes.Create 100 with
+                ParseAndCheckFileInProjectKeepStrongly = 1
+                ParseAndCheckFileInProjectKeepWeakly = 0 }
+
+    let expectOkWithSymbolUses parseAndCheckResults ctx =
+        expectOk parseAndCheckResults ctx
+        Assert.NotEmpty((getTypeCheckResult parseAndCheckResults).GetAllUsesOfAllSymbolsInFile())
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            checkFile "A" expectOkWithSymbolUses
+            checkFile "B" expectOk
+            withChecker (fun _ -> async { collectGarbage () })
+            checkFile "A" expectOkWithSymbolUses
+            checkFile "C" expectOk
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
 [<Theory>]
 [<InlineData true>]
 [<InlineData false>]

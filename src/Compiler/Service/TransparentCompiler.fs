@@ -78,6 +78,22 @@ type internal TcInfo =
 
     member x.TcDiagnostics = Array.concat (List.rev x.tcDiagnosticsRev)
 
+/// The type check sink of a cached file result. A checker that keeps background resolutions or symbol uses
+/// keeps it for as long as the result is cached. Otherwise only the request that computed the result holds it
+/// strongly, and a later request that needs it checks the file again.
+[<NoEquality; NoComparison>]
+type internal TcIntermediateSink =
+    | Kept of TcResultsSinkImpl
+    | Released of WeakReference<TcResultsSinkImpl>
+
+    member this.TryGet() =
+        match this with
+        | Kept sink -> Some sink
+        | Released weak ->
+            match weak.TryGetTarget() with
+            | true, sink -> Some sink
+            | _ -> None
+
 [<NoEquality; NoComparison>]
 type internal TcIntermediate =
     {
@@ -95,7 +111,7 @@ type internal TcIntermediate =
 
         tcDependencyFiles: string list
 
-        sink: TcResultsSinkImpl
+        mutable sink: TcIntermediateSink
     }
 
 /// Things we need to start parsing and checking files for a given project snapshot
@@ -1543,7 +1559,7 @@ type internal TransparentCompiler
                             moduleNamesDict = moduleNamesDict
                             tcDiagnosticsRev = [ errHandler.CollectedPhasedDiagnostics ]
                             tcDependencyFiles = [ fileName ]
-                            sink = sink
+                            sink = TcIntermediateSink.Kept sink
                         }
                 finally
                     ()
@@ -1558,6 +1574,10 @@ type internal TransparentCompiler
             | NodeToTypeCheck.PhysicalFile index ->
 
                 let! tcIntermediate = ComputeTcIntermediate projectSnapshot dependencyFiles index fileNode bootstrapInfo tcInfo
+
+                let sink =
+                    tcIntermediate.sink.TryGet()
+                    |> Option.defaultWith (fun () -> TcResultsSinkImpl(bootstrapInfo.TcGlobals))
 
                 let (Finisher(node = node; finisher = finisher)) = tcIntermediate.finisher
 
@@ -1588,11 +1608,7 @@ type internal TransparentCompiler
                                 graphNode = Some node
                                 stateContainsNodes = tcInfo.stateContainsNodes |> Set.add node
                                 tcIntermediateIds = tcInfo.tcIntermediateIds |> Set.add tcIntermediate.id
-                                sink =
-                                    if collectSinks then
-                                        tcIntermediate.sink :: tcInfo.sink
-                                    else
-                                        [ tcIntermediate.sink ]
+                                sink = if collectSinks then sink :: tcInfo.sink else [ sink ]
                             })
                     )
 
