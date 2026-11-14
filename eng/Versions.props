@@ -37,10 +37,10 @@
     <!-- -->
     <!-- FSharp.Compiler.Service version -->
     <FCSMajorVersion>43</FCSMajorVersion>
-    <FCSMinorVersion>14</FCSMinorVersion>
+    <FCSMinorVersion>13</FCSMinorVersion>
     <FCSBuildVersion>$(FSBuildVersion)</FCSBuildVersion>
-    <FCSRevisionVersion>$(FSRevisionVersion)</FCSRevisionVersion>
-    <FSharpCompilerServicePackageVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion)</FSharpCompilerServicePackageVersion>
+    <FCSRevisionVersion>1</FCSRevisionVersion>
+    <FSharpCompilerServicePackageVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion).$(FCSRevisionVersion)-mga1.1</FSharpCompilerServicePackageVersion>
     <FSharpCompilerServiceVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion).$(FCSRevisionVersion)</FSharpCompilerServiceVersion>
     <FSharpLibrariesChangelogVersion>$(FSMajorVersion).$(FSMinorVersion).$(FSBuildVersion)</FSharpLibrariesChangelogVersion>
     <!-- -->
