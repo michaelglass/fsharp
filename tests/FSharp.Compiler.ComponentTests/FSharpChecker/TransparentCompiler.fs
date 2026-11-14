@@ -662,6 +662,41 @@ let ``A file whose cached sink was released is checked again with its resolution
     finally
         builder.DeleteProjectDir()
 
+[<Fact>]
+let ``A later request that needs a file's resolutions gets them after the file's cached sink was released`` () =
+    let project =
+        SyntheticProject.Create(
+            { sourceFile "A" [] with Source = "type T = { X: int }\nlet a = { X = 1 }" },
+            { sourceFile "B" [ "A" ] with Source = "let value : ModuleA.T = ModuleA.a" })
+
+    let checker = foregroundOnlyChecker (CacheSizes.Create 100)
+
+    let initialContext = { Project = project; Signatures = Map.empty; Cursor = None }
+    let builder = ProjectWorkflowBuilder(project, initialContext, checker = checker, useTransparentCompiler = true)
+
+    try
+        builder {
+            saveAll
+            // The first request computes and caches A's result.
+            checkFile "B" expectOk
+            withChecker (fun _ -> async { collectGarbage () })
+            // A second request runs A's cached result again and reads every file's resolutions.
+            withChecker (fun checker ->
+                async {
+                    let options = project.GetProjectOptions checker
+                    let! snapshot = FSharpProjectSnapshot.FromOptions(options, DocumentSource.FileSystem)
+                    let! results = checker.ParseAndCheckProject(snapshot)
+
+                    let usesInA =
+                        results.GetAllUsesOfAllSymbols()
+                        |> Array.filter (fun symbolUse -> symbolUse.FileName.EndsWith "FileA.fs")
+
+                    Assert.NotEmpty usesInA
+                })
+        } |> ignore
+    finally
+        builder.DeleteProjectDir()
+
 [<Theory>]
 [<InlineData true>]
 [<InlineData false>]
