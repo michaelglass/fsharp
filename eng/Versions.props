@@ -39,8 +39,8 @@
     <FCSMajorVersion>43</FCSMajorVersion>
     <FCSMinorVersion>13</FCSMinorVersion>
     <FCSBuildVersion>$(FSBuildVersion)</FCSBuildVersion>
-    <FCSRevisionVersion>1</FCSRevisionVersion>
-    <FSharpCompilerServicePackageVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion).$(FCSRevisionVersion)-mg.1</FSharpCompilerServicePackageVersion>
+    <FCSRevisionVersion>$(FSRevisionVersion)</FCSRevisionVersion>
+    <FSharpCompilerServicePackageVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion)</FSharpCompilerServicePackageVersion>
     <FSharpCompilerServiceVersion>$(FCSMajorVersion).$(FCSMinorVersion).$(FCSBuildVersion).$(FCSRevisionVersion)</FSharpCompilerServiceVersion>
     <FSharpLibrariesChangelogVersion>$(FSMajorVersion).$(FSMinorVersion).$(FSBuildVersion)</FSharpLibrariesChangelogVersion>
     <!-- -->
